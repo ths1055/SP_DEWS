@@ -7,6 +7,7 @@ train:
   - roboflow_small/train/images
 val:
   - roboflow_drone/valid/images
+  - negatives_val/images
   - roboflow_small/valid/images
 
 names:

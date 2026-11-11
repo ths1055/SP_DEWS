@@ -23,6 +23,7 @@ def main():
     p.add_argument("--batch", type=int, default=16)
     p.add_argument("--device", default="0", help="NVIDIA GPU: 0 / 맥 M칩: mps / 없으면 cpu")
     p.add_argument("--name", default="drone_v1")
+    p.add_argument("--patience", type=int, default=30, help="이 epoch 동안 개선 없으면 조기종료 (0이면 끔)")
     p.add_argument("--workers", type=int, default=4, help="윈도우에서 에러 나면 0~2로")
     p.add_argument("--fraction", type=float, default=1.0, help="0.05면 데이터 5%만 써서 빠른 테스트")
     args = p.parse_args()
@@ -33,7 +34,7 @@ def main():
         model = YOLO(args.model)
         model.train(
             data=args.data, imgsz=args.imgsz, epochs=args.epochs, batch=args.batch,
-            device=args.device, name=args.name, patience=20,
+            device=args.device, name=args.name, patience=args.patience,
             workers=args.workers, fraction=args.fraction,
             # 작은 물체/하늘 배경 대응 증강
             mosaic=1.0, scale=0.5, fliplr=0.5, degrees=5.0, hsv_v=0.4,

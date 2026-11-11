@@ -13,6 +13,7 @@ KNOWN = {
     "antiuav":        ("antiuav/images/train", "antiuav/images/val"),
     "mavvid":         ("mavvid/train/images", "mavvid/val/images"),
     "negatives":      ("negatives/images", None),
+    "negatives_val":  (None, "negatives_val/images"),   # 검증용 네거티브 (오탐을 점수에 반영)
 }
 IMG_EXT = (".jpg", ".jpeg", ".png", ".bmp")
 
@@ -46,6 +47,13 @@ def main():
     for name, (tr, va) in sets.items():
         nt, lt = count(root, tr)
         nv, lv = count(root, va)
+        if tr is None:  # 검증 전용 폴더
+            if nv and lv:
+                val.append(va)
+                print(f"  [O] {name:15s} val {nv}장 (검증 전용)")
+            else:
+                print(f"  [ ] {name:15s} 없음")
+            continue
         if nt == 0:
             print(f"  [ ] {name:15s} 없음")
             continue
