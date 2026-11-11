@@ -1,0 +1,13 @@
+# tools/make_yaml.py 가 자동 생성
+path: D:/datasets
+
+train:
+  - roboflow_drone/train/images
+  - negatives/images
+  - roboflow_small/train/images
+val:
+  - roboflow_drone/valid/images
+  - roboflow_small/valid/images
+
+names:
+  0: drone
