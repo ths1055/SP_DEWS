@@ -20,6 +20,9 @@ import numpy as np
 import supervision as sv
 from trackers import ByteTrackTracker
 
+from lcd_ui import make_lcd
+from video_link import make_video_link
+
 LEVEL_NAME = {0: "CLEAR", 1: "DETECTED", 2: "WARNING"}
 LEVEL_COLOR = {0: (0, 200, 0), 1: (0, 200, 255), 2: (0, 0, 255)}  # BGR
 
@@ -166,7 +169,7 @@ class ThreatJudge:
                 if approaching or cur >= self.near_area:
                     self.warn_until[tid] = now + self.warn_hold_s
                 lvl = 2 if now < self.warn_until.get(tid, 0) else 1
-                self.state[tid] = (now, dict(id=int(tid), conf=round(float(conf), 3),
+                self.state[tid] = (now, dict(id=int(tid) + 1, conf=round(float(conf), 3),   # 보이는 번호는 1부터 (detect_stereo와 같게)
                                              box=[round(float(v), 1) for v in xyxy],
                                              area=round(cur, 5), approaching=approaching, level=lvl))
         # 이번 프레임에 안 잡혔어도 hold_s 이내에 확인된 표적은 유지
@@ -221,6 +224,27 @@ class Alerter:
             self.buzzer.off()
 
 
+# 부저 핀이 다른 장치 핀과 겹치면 출력끼리 부딪혀 핀이 상할 수 있음 (BCM 번호, E22 배선은 루트 README 3-1)
+E22_PINS = {14: "E22 RXD (UART TX)", 15: "E22 TXD (UART RX)", 17: "E22 AUX", 22: "E22 M0", 27: "E22 M1"}
+LCD_PINS = {2: "LCD SDA (I2C)", 3: "LCD SCL (I2C)"}
+HAT_PINS = {0: "HAT ID EEPROM", 1: "HAT ID EEPROM"}
+
+
+def check_buzzer_pin(ap, pin, lcd=False, lora=False):
+    """실행 전에 막기: --lcd면 I2C 핀, --lora면 E22 핀과 겹치면 에러. E22 핀은 --lora 없어도 경고"""
+    if pin is None:
+        return
+    used = dict(HAT_PINS)
+    if lcd:
+        used.update(LCD_PINS)
+    if lora:
+        used.update(E22_PINS)
+    if pin in used:
+        ap.error(f"--buzzer-pin {pin}은 {used[pin]} 핀이라 못 씀 → 다른 핀으로 (예: --buzzer-pin 18)")
+    if pin in E22_PINS:
+        print(f"[주의] GPIO{pin}은 {E22_PINS[pin]} 자리. E22가 꽂혀 있으면 부저 출력과 부딪힘 → --buzzer-pin 18 권장")
+
+
 def draw(frame, tracks, level, fps):
     for t in tracks:
         x1, y1, x2, y2 = map(int, t["box"])
@@ -247,18 +271,28 @@ def main():
     ap.add_argument("--min-hits", type=int, default=5)
     ap.add_argument("--near-area", type=float, default=0.02)
     ap.add_argument("--udp", default=None, help="경고 JSON 보낼 곳 host:port")
-    ap.add_argument("--buzzer-pin", type=int, default=None, help="GPIO 번호 (예: 17)")
+    ap.add_argument("--buzzer-pin", type=int, default=None, help="GPIO 번호 (예: 18, 17은 E22 AUX라 안 됨)")
     ap.add_argument("--show", action="store_true")
+    ap.add_argument("--lcd", nargs="?", const="0x27", default=None, metavar="ADDR",
+                    help="1602 I2C LCD 상태 화면 (주소 기본 0x27, fake = 터미널 미리보기)")
+    ap.add_argument("--lcd-no-blink", action="store_true", help="WARNING 때 LCD 백라이트 안 깜빡임")
+    ap.add_argument("--video-link", nargs="?", const=8090, type=int, default=None, metavar="PORT",
+                    help="Wi-Fi 영상 송출 (지휘소 gui.py가 받음, 기본 포트 8090)")
     args = ap.parse_args()
+    check_buzzer_pin(ap, args.buzzer_pin, lcd=bool(args.lcd) and str(args.lcd).lower() != "fake")
 
+    lcd = make_lcd(args.lcd, blink=not args.lcd_no_blink)
+    lcd.message("SP_DEWS mono", "model loading")
     det = (HailoDetector(args.hef, args.conf) if args.backend == "hailo"
            else UltralyticsDetector(args.weights, args.imgsz, args.conf))
+    lcd.message("SP_DEWS mono", "camera start")
     cam = Camera(args.source, (args.width, args.height))
     # 작은 드론은 신뢰도가 낮게 나오는 경우가 많아서 기본값(0.7)보다 낮춤
     tracker = ByteTrackTracker(frame_rate=args.fps, track_activation_threshold=0.35,
                                high_conf_det_threshold=0.4, lost_track_buffer=args.fps)
     judge = ThreatJudge(min_hits=args.min_hits, near_area=args.near_area)
     alerter = Alerter(args.udp, args.buzzer_pin)
+    vlink = make_video_link(args.video_link)
 
     fps, t_prev = 0.0, time.time()
     try:
@@ -281,6 +315,8 @@ def main():
 
             fps = 0.9 * fps + 0.1 / max(now - t_prev, 1e-6)
             t_prev = now
+            lcd.update(level, tracks, fps)   # 저장만 하고 바로 리턴 (LCD 쓰기는 별도 스레드)
+            vlink.push(frame.copy() if args.show else frame, level, tracks)   # --show는 frame에 바로 그려서 복사본
             if args.show:
                 draw(frame, tracks, level, fps)
                 cv2.imshow("drone", frame)
@@ -289,6 +325,8 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        lcd.close()                      # LCD에 stopped / ERR 남김
+        vlink.close()                    # 녹화 중이던 경고 클립은 저장하고 끝냄
         alerter.close()
         cam.close()
         det.close()

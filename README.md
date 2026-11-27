@@ -14,6 +14,7 @@
 [관측소 Pi]  detect_stereo.py → alert_gen.py → alert_tx.py → protocol.py → e22.py ──LoRa 900MHz──┐
 [지휘소 PC]  alert_rx.py → protocol.py → e22.py ←─────────────────────────────────────────────────┘
                  └→ (UDP JSON) → gui.py
+[관측소 Pi]  detect_stereo.py --video-link (video_link.py) ──Wi-Fi: 라이브 영상·경고 클립──→ gui.py
 ```
 
 | 블록                  | 내용                                 | 담당             |
@@ -38,6 +39,7 @@
 | ----------------------- | ---------------------------------------------------- | ----------------------- | -------------------------------------------------- |
 | `protocol.py`         | import (자체 시험: `python protocol.py`)           | 완료, 자체 시험 통과    | 패킷 포장·개봉, CRC-16, 스트림 파서, seq 카운터   |
 | `e22.py`              | import (설정 도구: `python e22.py --read/--write`, 자체 시험: `--test`) | 작성 완료, 실기 시험 전 | 모드 전환(M0/M1), AUX 대기, 송수신, 레지스터 설정  |
+| `alert_gen.py`        | import (`detect_stereo.py --lora`, 자체 시험: `python alert_gen.py`) | 작성 (임시, 호재 확인 필요), 자체 시험 통과 | 관측소 경보 생성: 탐지 결과 → 관심·경계·위험 → 전송 정책대로 `AlertTx` 큐, 표적 없으면 생존 신호 |
 | `alert_tx.py`         | import (실기 시험: `python alert_tx.py`)           | 작성 완료, 실기 시험 전 | 관측소 송신: 우선순위 TX 큐 + LoRa 스레드, ACK 대기·재전송 |
 | `alert_rx.py`         | 직접 실행                                            | 작성 완료, 실기 시험 전 | 지휘소 수신: ACK 회신, `(node_id, seq)` 중복 제거, GUI로 UDP JSON |
 | `test/test_alert.py`  | 직접 실행 (하드웨어 불필요)                          | 통과                    | 가짜 E22 2개로 우선순위·재전송·중복 제거·UDP 확인 |
@@ -45,6 +47,9 @@
 | `test/test_recv.py`   | 직접 실행                                            | 실기 송수신 확인        | 수신 시험, 종료 시 전달률·CRC 오류·누락 seq 출력 |
 | `test/rssi_check.py`  | 직접 실행                                            | 실기 확인               | 채널 잡음·마지막 수신 패킷 세기(dBm) — 무선부 고장 진단용 |
 | `lcd.py`              | import                                               | 정리함                  | I2C 16×2 LCD (PCF8574, 0x27). ASCII만 가능        |
+| `gui.py`              | 직접 실행 (`--demo`, `--lora COM4`, 자체 시험: `--selftest`) | 작성, 데모·가짜 LoRa로 시험 통과 | 지휘소 앱 (PySide6 창): 전술 스코프·주 표적·Wi-Fi 영상·기록·한국어 음성 안내·관측소 신호 끊김 표시 |
+| `hud/`                | import                                               | 작성                    | gui.py 화면 조각: `model.py` 경보→표적 상태, `media.py` 영상·음성·경보음, `widgets.py` 그림, `fonts/` (SIL OFL) |
+| `build_exe.py`        | 직접 실행 (윈도우)                                   | 빌드 스크립트 확인       | gui.py → `dist/SP_DEWS_HUD/SP_DEWS_HUD.exe` (파이썬 없는 PC에서도 실행) |
 
 `test/` 안의 스크립트는 상위 `modules/`를 import 경로에 넣으므로 어느 폴더에서 실행해도 됩니다 (예: `modules`에서 `python test/test_send.py`).
 
@@ -54,7 +59,7 @@
 - 채널은 데이터 성격대로: 경보(빠지면 안 됨) = 크기 제한 `PriorityQueue`(위험 > 경계 > 관심, 가득 차면 새 것 버림), 종료 신호 = `threading.Event`
 - 재전송은 같은 seq 그대로 → 지휘소는 중복이어도 ACK를 다시 보내고(앞 ACK 유실 대비) GUI에는 한 번만 넘김
 - 지휘소는 장치가 LoRa 하나라 메인 루프가 E22를 독점(스레드 없음), GUI는 별도 프로세스(UDP `127.0.0.1:5005`)
-- 최신값 Mailbox는 ⑤ → ⑥(`alert_gen.py`)에서 필요해지면 추가
+- ⑤ → ⑥은 탐지 루프가 `AlertGen.update()`를 바로 부름. 큐에 넣기만 해서 금방 끝나므로 최신값 Mailbox는 안 씀
 
 ### 기존 코드에서 고친 문제 (재발 방지용 기록)
 
@@ -97,7 +102,7 @@
 | type       | 1 B  | `B`  | 0 경보, 1 ACK                                                              |
 | node_id    | 1 B  | `B`  | 관측소 번호                                                                |
 | seq        | 1 B  | `B`  | 0~255 순환                                                                 |
-| track_id   | 1 B  | `B`  | ByteTrack ID 하위 8비트                                                    |
+| track_id   | 1 B  | `B`  | 표적 번호 1~255 (ByteTrack ID를 1부터 접음). 0 + 등급 0 = 관측소 생존 신호 |
 | level_mode | 1 B  | `B`  | 하위 2비트 등급(0 없음·1 관심·2 경계·3 위험), 비트7 = stereo(1)/mono(0) |
 | dist       | 2 B  | `H`  | cm                                                                         |
 | speed      | 2 B  | `h`  | 접근 속도 cm/s, + = 다가옴                                                 |
@@ -126,14 +131,26 @@
 Threat(track_id, level, dist_m, speed_mps, tta_s, az_deg, el_deg, mode)  # mode: "stereo" | "mono"
 ```
 
-**전송 정책** (⑥에서 구현 예정)
+지금 `alert_gen.py`는 `detect_stereo.py`의 RangeJudge가 주는 표적 dict(`id, dist_m, src, closing_mps, tta_s, az_deg, el_deg, level`)를 그대로 받습니다. RangeJudge 등급은 1(감지)/2(WARNING)뿐이라 3단계는 `alert_gen`이 나눔: **위험** = 경고선(20 m) 안 또는 5초 안 도달, **경계** = 탐지 WARNING, **관심** = 나머지.
+
+**전송 정책** (`alert_gen.py`에 구현, 호재 확인 필요)
 
 - 매 프레임(30 fps) 전송 금지 — LoRa 대역폭 초과
-- 등급이 바뀌면 즉시 전송, 같은 등급은 1~2초마다 갱신, 위험 등급은 더 자주
+- 새 표적·등급 변화는 즉시, 같은 등급은 관심 2초·경계 1초·위험 0.5초마다 갱신
+- 송신이 밀리면(끝나지 않은 경보 3건 이상) 같은 등급 갱신은 미룸 → 큐에 옛날 위치가 안 쌓이고, 풀리면 오래 기다린 표적부터 최신 값으로
+- 표적이 사라지면 '없음' 한 번
+- 표적이 없으면 5초마다 **생존 신호**(등급 0 + track_id 0) → 지휘소가 15초 넘게 아무것도 못 받으면 "관측소 신호 끊김"(드론 없음과 구분)
 - 재전송 타임아웃 = 실측 송신 시간 × 2 + 여유, 최대 재전송 횟수는 2초 목표 안에 들어가게
 - 지휘소 중복 제거 키는 `(node_id, seq)`
 
 **지휘소 내부 전달**: `alert_rx.py`가 수신 결과를 로컬 UDP JSON으로 보내고 `gui.py`가 받는 구조 → GUI를 LoRa 없이 따로 개발·시험 가능
+
+**영상 전달 (Wi-Fi, LoRa와 따로)**
+
+- LoRa로는 영상 불가: 2.4 kbps면 작은 JPEG 한 장(약 2 KB)에도 7초 넘게 걸리고, 그동안 경보 채널이 막힘
+- 관측소 Pi 5 내장 Wi-Fi로 따로 보냄: Pi를 핫스팟(`SP_DEWS`, Pi 주소 10.42.0.1)으로 두고 노트북이 붙음. 20 m는 충분
+- 라이브 MJPEG (가로 640, 10 fps, 약 2~3 Mbps) + 경고(WARNING) 앞 3초·끝난 뒤 4초 클립 자동 저장 (`yolo_module/pi/clips/`)
+- 경보는 항상 LoRa로 먼저 오고, Wi-Fi가 닿을 때만 영상이 붙음 (Wi-Fi가 끊겨도 경보 표시는 그대로)
 
 ---
 
@@ -145,6 +162,8 @@ Threat(track_id, level, dist_m, speed_mps, tta_s, az_deg, el_deg, mode)  # mode:
 
 필요 패키지: `pyserial`, `gpiozero`(Pi 5는 `lgpio` 백엔드), `RPLCD`(LCD)
 
+GPIO 정리 (BCM): E22 = 14·15·17·22·27, LCD = 2·3 (I2C), **부저 = 18**. 겹치게 주면 `detect_*.py`가 실행 전에 에러로 막음 (17은 E22 AUX라 부저 출력과 부딪힘)
+
 ### 시험 순서
 
 | 순서 | 어디서          | 명령                                                          | 확인                        |
@@ -155,6 +174,7 @@ Threat(track_id, level, dist_m, speed_mps, tta_s, az_deg, el_deg, mode)  # mode:
 | 4    | 수신 → 송신 순 | `python test/test_recv.py --raw` / `python test/test_send.py --raw` | `hello 0, 1, ...` 수신    |
 | 5    | 수신 → 송신 순 | `python test/test_recv.py` / `python test/test_send.py --count 100` | 패킷 출력, Ctrl+C 후 전달률 |
 | 6    | 수신 → 송신 순 | `python alert_rx.py` / `python alert_tx.py --count 20`  | ACK 20/20, 재전송 횟수 확인 |
+| 7    | 지휘소 → 관측소 | `python gui.py --lora COM4` / `python3 detect_stereo.py ... --lora --node-id 1` (`yolo_module/pi`) | 앱 머리줄 "● 관측소 1 정상", 드론 보이면 관심→경계→위험 |
 
 노트북은 `--no-gpio --port COM3`(또는 `/dev/ttyUSB0`)을 붙입니다.
 
@@ -169,6 +189,29 @@ Threat(track_id, level, dist_m, speed_mps, tta_s, az_deg, el_deg, mode)  # mode:
 
 **⚠ 안테나를 연결하지 않은 상태로 송신하지 말 것** (모듈 손상 가능)
 
+### 지휘소 앱 (`gui.py`)
+
+```bash
+pip install PySide6-Addons pyserial      # 처음 한 번 (음성·소리 모듈이 Addons에 있음)
+python gui.py --demo                     # LoRa 없이 가짜 경보로 화면 확인
+python gui.py --lora COM4                # alert_rx까지 한 번에 (앱 위쪽 'LoRa' 버튼으로 골라도 됨)
+python gui.py                            # alert_rx.py를 따로 켤 때 (위 1장 구조 그대로)
+python gui.py --selftest                 # 하드웨어·화면 없이 자체 시험
+pip install pyinstaller && python build_exe.py   # exe 만들기 → dist/SP_DEWS_HUD/SP_DEWS_HUD.exe
+```
+
+- 머리줄 관측소 상태: **● 정상**(생존 신호 받는 중 → "표적 없음"이면 정말 없는 것) / **신호 끊김**(15초 넘게 아무것도 안 옴 → 주황 표시 + 음성 "관측소 1 신호 끊김", 다시 오면 "복구"). 생존 신호를 안 보내는 예전 송신 코드면 마지막 수신 시각만 보여줌
+- 데모를 끄면 가짜 표적·관측소 기록은 지워짐
+- 버튼으로 바꾼 설정(LoRa 포트, 영상 주소, 음성·경보음, 스코프 범위)은 저장돼서 다음 실행 때 그대로
+- 음성 안내는 Windows 내장 한국어 음성. 없으면 자막만 나옴 (설정 > 시간 및 언어 > 음성에서 한국어 추가)
+- 단축키: F11 전체 화면, V 음성, S 경보음, R 범위, L 라이브
+
+**Wi-Fi 영상 붙이기**
+
+1. Pi: `sudo nmcli device wifi hotspot ifname wlan0 ssid SP_DEWS password <8자 이상>` (Pi 주소가 10.42.0.1이 됨. 이후 SSH도 이 Wi-Fi로)
+2. Pi: `python3 detect_stereo.py ... --video-link` (기본 포트 8090)
+3. 노트북: Wi-Fi `SP_DEWS`에 연결 → 앱이 `http://10.42.0.1:8090`을 알아서 찾음 (다르면 '영상 주소' 버튼)
+
 ---
 
 ## 5. 진행 현황과 다음 작업
@@ -181,8 +224,9 @@ Threat(track_id, level, dist_m, speed_mps, tta_s, az_deg, el_deg, mode)  # mode:
 | 11/1주      | 보드 2대 송수신 시험                   | `test/test_send.py`, `test/test_recv.py` | 송수신 확인 (11/17, 노트북↔PC) |
 | 11/2주      | ACK 대기·재전송 (송신 측)             | `alert_tx.py`                    | 작성, 실기 시험 전       |
 | 11/2주      | ACK 회신·중복 제거 (수신 측)          | `alert_rx.py`                    | 작성, 실기 시험 전       |
-| 11/2~3주    | 판정 결과 → 경보 생성, 부저·LCD      | `alert_gen.py`                   | 예정                     |
-| 11/3주      | 지휘소 GUI 연동 (공동)                 | `gui.py`                         | 예정                     |
+| 11/2~3주    | 판정 결과 → 경보 생성 (부저·LCD는 탐지 쪽 `--buzzer-pin`·`--lcd`) | `alert_gen.py`, `detect_stereo.py --lora` | 작성 (임시, 호재 확인 필요). 가짜 카메라 → 가짜 E22 → 지휘소 앱까지 시험 통과 |
+| 11/3주      | 지휘소 GUI 연동 (공동)                 | `gui.py`, `hud/`                 | 작성 (데모·가짜 LoRa 시험 통과, 실기 전) |
+| 11/4주      | Wi-Fi 영상 (라이브·경고 클립)          | `yolo_module/pi/video_link.py`   | 작성 (가짜 카메라로 시험 통과) |
 | 11/3~4주    | 표시 지연·전달률 측정                 | `test_link.py`                   | 예정                     |
 | 11/4~12/1주 | 실외 20 m 시험, 다중 표적, 데모 리허설 | —                                 | 예정                     |
 
@@ -197,6 +241,8 @@ Threat(track_id, level, dist_m, speed_mps, tta_s, az_deg, el_deg, mode)  # mode:
 - ⑤ → ⑥ `Threat` 인터페이스 노지헌 님과 합의
 - 국내 LoRa 출력 기준 확인 후 `tx_power_dbm` 조정
 - 임베디드 요건: TF-Luna 제외 후 GPIO 부저·I2C LCD로 입출력 장치 요건 충족 여부 (교수님 상담 사항)
+- 생존 신호(등급 0 + track_id 0, 표적 없을 때 5초마다)와 지휘소 "신호 끊김" 기준 15초 — `alert_gen.py`·`gui.py`에 구현함, 주기·기준 팀 확인 필요 (LoRa 대역폭: 경보 + ACK 1회가 5초에 한 번)
+- 3단계 등급(관심·경계·위험)을 ⑤ 위협 판정이 직접 줄지, 지금처럼 `alert_gen.py`가 나눌지
 
 ---
 

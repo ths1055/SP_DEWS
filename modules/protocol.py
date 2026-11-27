@@ -9,6 +9,8 @@ ACK 패킷 6 B
   magic(1) type(1) node(1) seq(1) crc16(2)
 
 - 모든 정수는 big-endian
+- track: 표적 번호 1~255 (ByteTrack ID를 접음). track 0 + 등급 0 = 관측소 생존 신호
+  (표적이 없을 때 5초마다, alert_gen.py → 지휘소가 "드론 없음"과 "LoRa 끊김"을 구분) — 팀 확인 전
 - level_mode: 하위 2비트 = 등급(0 없음, 1 관심, 2 경계, 3 위험), 비트7 = 1이면 stereo, 0이면 mono
 - speed: 접근 속도, + 가 다가오는 방향, cm/s
 - tta: 도달 예상 시간 0.1 s 단위, 255 = 해당 없음

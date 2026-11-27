@@ -3,3 +3,7 @@
 # python
 __pycache__/
 transceiver.ino
+# 지휘소 앱 빌드, 경고 클립
+modules/build/
+modules/dist/
+yolo_module/pi/clips/

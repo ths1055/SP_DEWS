@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 아이폰(또는 다른 Pi)이 보낸 경고 JSON 받아서 출력 + 부저
-  python3 udp_receiver.py --port 5005 --buzzer-pin 17
+  python3 udp_receiver.py --port 5005 --buzzer-pin 18      (17은 E22 AUX 자리라 쓰지 말 것)
 """
 import argparse
 import json
@@ -14,7 +14,7 @@ NAME = {0: "CLEAR", 1: "DETECTED", 2: "WARNING"}
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=5005)
-    ap.add_argument("--buzzer-pin", type=int, default=None)
+    ap.add_argument("--buzzer-pin", type=int, default=None, help="GPIO 번호 (예: 18, 17은 E22 AUX라 안 됨)")
     args = ap.parse_args()
 
     buzzer = None

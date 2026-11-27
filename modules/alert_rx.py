@@ -73,6 +73,9 @@ if __name__ == "__main__":
         try:
             while True:
                 for a in rx.poll():
+                    if a.level == 0 and a.track_id == 0:     # 관측소 생존 신호 (표적 없을 때 5초마다, alert_gen)
+                        print(f"노드 {a.node_id} seq {a.seq:3d} | 생존 신호")
+                        continue
                     tta = "-" if a.tta_s is None else f"{a.tta_s:.1f}s"
                     print(f"노드 {a.node_id} seq {a.seq:3d} | ID {a.track_id} | {LEVEL_NAMES[a.level]} "
                           f"| {a.dist_m:.2f} m | {a.speed_mps:+.2f} m/s | 도달 {tta}")

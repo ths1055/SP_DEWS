@@ -7,6 +7,9 @@
   # 녹화본으로 맥/PC 테스트
   python3 detect_stereo.py --backend ultralytics --weights best.pt --calib stereo_calib.npz \
       --video left.mp4 right.mp4 --show
+  # 지휘소로 LoRa 경보 (modules/alert_gen.py → alert_tx.py, E22 /dev/serial0) + LCD + Wi-Fi 영상
+  python3 detect_stereo.py --backend hailo --hef drone.hef --calib stereo_calib.npz --lora --node-id 1 \
+      --lcd --video-link --buzzer-pin 18
 
 흐름: 좌/우 동시 캡처 → 양쪽 YOLO 검출 → 중심점만 평행화 → 같은 높이(y) 짝짓기
       → 시차(disparity)로 거리 Z = f·B/d → 짝 못 찾으면 드론 크기로 단안 추정
@@ -17,15 +20,19 @@
   2 WARNING  : warn_m 이내, 또는 watch_m 이내에서 approach_mps 이상으로 접근, 또는 도달예상 tta_s 이하
 """
 import argparse
+import sys
 import time
 from collections import defaultdict, deque
+from pathlib import Path
 
 import cv2
 import numpy as np
 import supervision as sv
 from trackers import ByteTrackTracker
 
-from detect_pi import HailoDetector, UltralyticsDetector, Alerter, LEVEL_NAME, LEVEL_COLOR
+from detect_pi import HailoDetector, UltralyticsDetector, Alerter, LEVEL_NAME, LEVEL_COLOR, check_buzzer_pin
+from lcd_ui import make_lcd
+from video_link import make_video_link
 
 
 # ---------------------------------------------------------------- 스테레오 기하
@@ -154,7 +161,8 @@ class RangeJudge:
             if now < self.warn_until.get(tid, 0):
                 lvl = 2
             self.state[tid] = (now, dict(
-                id=tid, conf=round(float(dets.confidence[k]), 3),
+                id=tid + 1,                 # 보이는 번호는 1부터 (ByteTrack은 0부터, LoRa track_id 0은 생존 신호 자리)
+                conf=round(float(dets.confidence[k]), 3),
                 box=[round(float(v), 1) for v in dets.xyxy[k]],
                 dist_m=None if dist is None else round(dist, 1),
                 src=src,
@@ -217,12 +225,27 @@ def main():
     ap.add_argument("--approach-mps", type=float, default=2.0)
     ap.add_argument("--min-hits", type=int, default=5)
     ap.add_argument("--udp", default=None)
-    ap.add_argument("--buzzer-pin", type=int, default=None)
+    ap.add_argument("--buzzer-pin", type=int, default=None, help="GPIO 번호 (예: 18, 17은 E22 AUX라 안 됨)")
+    ap.add_argument("--lora", nargs="?", const="/dev/serial0", default=None, metavar="PORT",
+                    help="지휘소로 LoRa 경보 (modules/alert_gen.py, E22 기본 /dev/serial0)")
+    ap.add_argument("--node-id", type=int, default=1, help="관측소 번호 0~255 (관측소마다 다르게)")
     ap.add_argument("--record", default=None, help="좌/우 원본 영상 저장 폴더")
     ap.add_argument("--show", action="store_true")
+    ap.add_argument("--lcd", nargs="?", const="0x27", default=None, metavar="ADDR",
+                    help="1602 I2C LCD 상태 화면 (주소 기본 0x27, fake = 터미널 미리보기)")
+    ap.add_argument("--lcd-no-blink", action="store_true", help="WARNING 때 LCD 백라이트 안 깜빡임")
+    ap.add_argument("--video-link", nargs="?", const=8090, type=int, default=None, metavar="PORT",
+                    help="Wi-Fi 영상 송출 (지휘소 gui.py가 받음, 기본 포트 8090)")
     args = ap.parse_args()
+    check_buzzer_pin(ap, args.buzzer_pin, lcd=bool(args.lcd) and str(args.lcd).lower() != "fake",
+                     lora=bool(args.lora))
+    if not 0 <= args.node_id <= 255:
+        ap.error("--node-id는 0~255 (패킷 1 B)")
 
+    lcd = make_lcd(args.lcd, blink=not args.lcd_no_blink)
+    lcd.message("SP_DEWS stereo", "calib loading")
     geo = StereoGeometry(args.calib)
+    lcd.message("SP_DEWS stereo", "camera start")
     if args.video:
         from stereo_cam import StereoVideo
         cam = StereoVideo(*args.video)
@@ -230,6 +253,7 @@ def main():
         from stereo_cam import StereoCamera
         cam = StereoCamera(geo.size, fps=args.fps, swap=args.swap)
 
+    lcd.message("SP_DEWS stereo", "model loading")
     det = (HailoDetector(args.hef, args.conf) if args.backend == "hailo"
            else UltralyticsDetector(args.weights, args.imgsz, args.conf))
     tracker = ByteTrackTracker(frame_rate=args.fps, track_activation_threshold=0.35,
@@ -237,6 +261,13 @@ def main():
     judge = RangeJudge(min_hits=args.min_hits, warn_m=args.warn_m, watch_m=args.watch_m,
                        approach_mps=args.approach_mps)
     alerter = Alerter(args.udp, args.buzzer_pin)
+    vlink = make_video_link(args.video_link)
+    gen = None
+    if args.lora:                        # ⑥ 경보 생성 → alert_tx 큐 (레포 루트 modules/ 에 있음)
+        sys.path.append(str(Path(__file__).resolve().parents[2] / "modules"))
+        from alert_gen import make_alert_gen
+        lcd.message("SP_DEWS stereo", "LoRa start")
+        gen = make_alert_gen(args.lora, args.node_id, warn_m=args.warn_m)
 
     writers = None
     if args.record:
@@ -279,10 +310,14 @@ def main():
             now = time.time() if not args.video else t_cap
             level, tracks = judge.update(dets, now)
             alerter.update(level, tracks, now)
+            if gen:
+                gen.update(tracks, now)          # 큐에 넣기만 함 (송신·ACK·재전송은 lora-tx 스레드)
 
             t = time.time()
             fps = 0.9 * fps + 0.1 / max(t - t_prev, 1e-6)
             t_prev = t
+            lcd.update(level, tracks, fps)   # 저장만 하고 바로 리턴 (LCD 쓰기는 별도 스레드)
+            vlink.push(l, level, tracks)   # 영상 송출도 참조만 넘기고 바로 리턴
             if args.show:
                 vis = l.copy()
                 draw(vis, tracks, level, fps, skew, int((src == "stereo").sum()) if len(bl) else 0)
@@ -292,10 +327,14 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        lcd.close()                      # LCD에 stopped / ERR 남김
+        vlink.close()                    # 녹화 중이던 경고 클립은 저장하고 끝냄
         if writers:
             for w in writers:
                 w.release()
         alerter.close()
+        if gen:
+            gen.close()                      # 남은 표적 '없음' 보내고 최대 2초 큐 비운 뒤 E22 닫음
         cam.close()
         det.close()
         cv2.destroyAllWindows()
