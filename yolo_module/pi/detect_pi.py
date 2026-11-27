@@ -41,32 +41,33 @@ def letterbox(img, new_w, new_h, pad=114):
 
 # ---------------------------------------------------------------- 검출기
 class HailoDetector:
-    """HEF는 Hailo Model Zoo로 NMS 포함 컴파일했다고 가정
-    (출력: 클래스별 [ymin, xmin, ymax, xmax, score], 0~1 정규화)"""
+    """HailoRT 5.x InferModel API (AI HAT+ 2 / Hailo-10H는 예전 VStreams API 미지원)
+    HEF는 Hailo Model Zoo로 NMS 포함 컴파일했다고 가정
+    (출력: HAILO_NMS_BY_CLASS, get_buffer()가 클래스별 (N,5) [ymin, xmin, ymax, xmax, score], 0~1 정규화)"""
+
+    RUN_TIMEOUT_MS = 1000
 
     def __init__(self, hef_path, conf):
-        from hailo_platform import (HEF, VDevice, HailoStreamInterface, InferVStreams,
-                                    ConfigureParams, InputVStreamParams, OutputVStreamParams, FormatType)
+        from hailo_platform import VDevice, FormatType
         self.conf = conf
-        self.hef = HEF(hef_path)
         self.device = VDevice()
-        cfg = ConfigureParams.create_from_hef(self.hef, interface=HailoStreamInterface.PCIe)
-        self.ng = self.device.configure(self.hef, cfg)[0]
-        in_info = self.hef.get_input_vstream_infos()[0]
-        self.in_name = in_info.name
-        self.in_h, self.in_w = in_info.shape[0], in_info.shape[1]
-        self.out_name = self.hef.get_output_vstream_infos()[0].name
-        in_p = InputVStreamParams.make(self.ng, format_type=FormatType.UINT8)
-        out_p = OutputVStreamParams.make(self.ng, format_type=FormatType.FLOAT32)
-        self.pipe = InferVStreams(self.ng, in_p, out_p)
-        self.pipe.__enter__()
-        self.act = self.ng.activate(self.ng.create_params())
-        self.act.__enter__()
+        self.model = self.device.create_infer_model(hef_path)
+        self.model.input().set_format_type(FormatType.UINT8)
+        # NMS 출력은 FLOAT32로 받아야 함 (기본 형식 버퍼로는 크기 불일치로 run 실패)
+        self.model.output().set_format_type(FormatType.FLOAT32)
+        self.in_h, self.in_w = self.model.input().shape[:2]
+        self._cfg_ctx = self.model.configure()
+        self.cm = self._cfg_ctx.__enter__()
+        self.bindings = self.cm.create_bindings()
+        self.out_buf = np.empty(self.model.output().shape, np.float32)
+        self.bindings.output().set_buffer(self.out_buf)
 
     def detect(self, frame_bgr):
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         img, r, dx, dy = letterbox(rgb, self.in_w, self.in_h)
-        out = self.pipe.infer({self.in_name: img[None]})[self.out_name][0]  # 배치 0
+        self.bindings.input().set_buffer(np.ascontiguousarray(img))
+        self.cm.run([self.bindings], self.RUN_TIMEOUT_MS)
+        out = self.bindings.output().get_buffer()   # 클래스별 (N,5) 배열 리스트
         boxes, scores, classes = [], [], []
         for c, dets in enumerate(out):
             for y1, x1, y2, x2, s in np.asarray(dets).reshape(-1, 5):
@@ -79,8 +80,7 @@ class HailoDetector:
         return np.array(boxes).reshape(-1, 4), np.array(scores), np.array(classes, dtype=int)
 
     def close(self):
-        self.act.__exit__(None, None, None)
-        self.pipe.__exit__(None, None, None)
+        self._cfg_ctx.__exit__(None, None, None)
         self.device.release()
 
 
