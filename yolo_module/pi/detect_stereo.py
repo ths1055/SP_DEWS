@@ -311,7 +311,8 @@ def main():
             level, tracks = judge.update(dets, now)
             alerter.update(level, tracks, now)
             if gen:
-                gen.update(tracks, now)          # 큐에 넣기만 함 (송신·ACK·재전송은 lora-tx 스레드)
+                # 큐에 넣기만 함 (송신·ACK·재전송은 lora-tx 스레드). 무선 주기는 실제 시간이라 안 튀는 시계로
+                gen.update(tracks, time.monotonic())
 
             t = time.time()
             fps = 0.9 * fps + 0.1 / max(t - t_prev, 1e-6)

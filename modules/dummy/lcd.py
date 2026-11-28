@@ -28,7 +28,7 @@ class LCD:
 
     def line_write(self, msg:str, row:int, col:int) -> None:
         try:
-            self._lcd._set_cursor_pos = (row, col)
+            self._lcd.cursor_pos = (row, col)
             if msg is not None and len(msg) > 0:
                 self._lcd.write_string(msg)
 

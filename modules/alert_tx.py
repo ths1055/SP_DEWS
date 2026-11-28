@@ -5,6 +5,8 @@ alert_tx.py — 경보 송신 (관측소, ⑥ → ⑦)
 PriorityQueue에 넣기만 하고, LoRa 스레드가 높은 등급부터 꺼내 송신 → ACK 대기 → 재전송.
 
   위험(3) > 경계(2) > 관심(1) > 없음(0), 같은 등급은 넣은 순서대로
+  같은 track_id는 최신 경보만: 기다리는 동안 더 새 경보가 들어오면 옛 것은 건너뜀 (stats["superseded"])
+    → 등급 순서 때문에 옛 경보가 나중에 도착해 지휘소에 옛 상태가 남는 일이 없음
   재전송은 같은 seq·같은 프레임 그대로 (지휘소가 (node_id, seq)로 중복 제거)
   큐가 가득 차면 새 경보를 버리고 stats["dropped"] 증가
 
@@ -20,6 +22,7 @@ PriorityQueue에 넣기만 하고, LoRa 스레드가 높은 등급부터 꺼내 
 from __future__ import annotations
 
 import itertools
+import os
 import queue
 import random
 import threading
@@ -28,10 +31,12 @@ from dataclasses import replace
 
 from protocol import Ack, Alert, PacketParser, SeqCounter, encode_alert, now_ms16
 
-# shortcut: 실측 전 추정값 (17 B 송신 + 6 B ACK, 2.4 kbps). test_send.py 송신 시간 실측 후
-#           ack_timeout ≈ (경보 + ACK 송신 시간) × 2, (1 + retries) × ack_timeout < 2 s 로 조정
-ACK_TIMEOUT_S = 0.6
-RETRIES = 2
+# shortcut: 실측 전 추정값 (경보+ACK 약 0.4~0.5 s 추정, 2.4 kbps). test/test_link.py 실측 후 조정
+#   ack_timeout: 경보+ACK 실측보다 넉넉히 (짧으면 ACK 오는 중에 또 보내서 채널을 두 배로 씀)
+#   마지막 재전송의 표시 시각 ≈ retries × ack_timeout + 송신 시간 → 2 s 안 (0.8 × 2 + 0.3 = 1.9 s)
+#   코드 안 고치고 바꾸기: SP_ACK_TIMEOUT=1.0 SP_RETRIES=1 python3 detect_stereo.py ...
+ACK_TIMEOUT_S = float(os.environ.get("SP_ACK_TIMEOUT", "0.8"))
+RETRIES = int(os.environ.get("SP_RETRIES", "2"))
 
 
 class AlertTx:
@@ -47,7 +52,8 @@ class AlertTx:
         self._parser = PacketParser()
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="lora-tx", daemon=True)
-        self.stats = {"acked": 0, "failed": 0, "retries": 0, "dropped": 0}
+        self._latest: dict[int, int] = {}     # track_id → 가장 최근에 넣은 경보의 순번
+        self.stats = {"acked": 0, "failed": 0, "retries": 0, "dropped": 0, "superseded": 0}
 
     # -- 다른 스레드에서 호출
     def start(self) -> None:
@@ -55,12 +61,14 @@ class AlertTx:
 
     def submit(self, alert: Alert) -> bool:
         """송신 대기열에 넣음. 가득 차 있으면 False."""
+        order = next(self._order)
         try:
-            self._q.put_nowait((-alert.level, next(self._order), alert))
-            return True
-        except queue.Full:
+            self._q.put_nowait((-alert.level, order, alert))
+        except queue.Full:                    # 버린 경보는 최신으로 치지 않음 (기다리던 옛 경보는 그대로 나감)
             self.stats["dropped"] += 1
             return False
+        self._latest[alert.track_id] = order
+        return True
 
     def flush(self) -> None:
         """대기열이 빌 때까지 대기 (송신·ACK 대기 포함)."""
@@ -75,10 +83,13 @@ class AlertTx:
     def _run(self) -> None:
         while not self._stop.is_set():
             try:
-                _, _, a = self._q.get(timeout=0.1)
+                _, order, a = self._q.get(timeout=0.1)
             except queue.Empty:
                 continue
             try:
+                if order < self._latest.get(a.track_id, order):   # 같은 표적의 더 새 경보가 기다리는 중
+                    self.stats["superseded"] += 1
+                    continue
                 self._deliver(replace(a, node_id=self.node_id, seq=self._seq.next(), ts_ms=now_ms16()))
             except Exception as e:            # 한 건 실패로 송신 스레드가 죽지 않게
                 self.stats["failed"] += 1

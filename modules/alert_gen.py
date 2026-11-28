@@ -16,7 +16,8 @@ alert_gen.py — 경보 생성 (⑥, 관측소): 탐지·판정 결과 → LoRa 
 
 전송 정책 (README 3-2)
   - 매 프레임(30 fps) 보내지 않음 → LoRa 대역폭 안에서
-  - 새 표적·등급 변화는 바로, 같은 등급이면 관심 2초·경계 1초·위험 0.5초마다 갱신
+  - 새 표적·등급 올림은 바로, 같은 등급이면 관심 2초·경계 1초·위험 1초마다 갱신 (실측 전 값, 환경 변수 SP_DANGER_PERIOD)
+  - 등급 내림은 낮은 등급이 1.5초 이어져야 (경고선 근처 거리 잡음에 위험↔경계가 깜빡이며 경보가 쏟아지지 않게)
   - 송신이 밀리면(끝나지 않은 경보 3건 이상) 같은 등급 갱신은 미룸
     → 큐에 옛날 위치가 쌓이지 않고, 풀리면 주기 대비 오래 기다린 표적부터 그때 최신 값으로 나감
   - 표적이 사라지면 '없음(0)' 한 번 → 지휘소가 바로 지움
@@ -26,16 +27,21 @@ alert_gen.py — 경보 생성 (⑥, 관측소): 탐지·판정 결과 → LoRa 
 """
 from __future__ import annotations
 
+import os
 import threading
 import time
 from typing import Optional
 
 from protocol import Alert
 
-PERIOD_S = {1: 2.0, 2: 1.0, 3: 0.5}       # 같은 등급 갱신 주기
+# 같은 등급 갱신 주기. 위험은 경보+ACK 시간(약 0.4~0.5 s 추정)의 2배 → 채널 절반은 다른 경보용으로 남김
+# shortcut: 실측 전 값. test/test_link.py 지연 중앙값 × 2로 조정 (모두 GUI 흐려짐 4 s 미만이어야)
+#   코드 안 고치고 바꾸기: SP_DANGER_PERIOD=0.5 python3 detect_stereo.py ...
+PERIOD_S = {1: 2.0, 2: 1.0, 3: float(os.environ.get("SP_DANGER_PERIOD", "1.0"))}
 HEARTBEAT_S = 5.0                          # 표적 없을 때 생존 신호 주기 (0이면 안 보냄)
 HEARTBEAT_TRACK = 0                        # 생존 신호의 track_id (실제 표적은 1~255)
 BACKLOG_MAX = 3                            # 끝나지 않은 경보가 이만큼이면 같은 등급 갱신은 미룸
+HOLD_S = 1.5                               # 등급 내림은 낮은 등급이 이만큼 이어져야 (탐지 쪽 WARNING 유지와 같은 값)
 
 
 def pkt_track_id(tid) -> int:
@@ -45,12 +51,14 @@ def pkt_track_id(tid) -> int:
 
 class AlertGen:
     def __init__(self, tx, warn_m: float = 20.0, tta_s: float = 5.0, period: Optional[dict] = None,
-                 heartbeat_s: float = HEARTBEAT_S, backlog_max: int = BACKLOG_MAX, lora=None):
+                 heartbeat_s: float = HEARTBEAT_S, backlog_max: int = BACKLOG_MAX, hold_s: float = HOLD_S,
+                 lora=None):
         self.tx, self.warn_m, self.tta_s = tx, warn_m, tta_s
         self.period = dict(PERIOD_S if period is None else period)
-        self.heartbeat_s, self.backlog_max = heartbeat_s, backlog_max
+        self.heartbeat_s, self.backlog_max, self.hold_s = heartbeat_s, backlog_max, hold_s
         self._lora = lora                          # close() 때 같이 닫을 E22 (make_alert_gen이 연 경우)
         self._sent: dict[int, tuple[int, float]] = {}   # track_id → (마지막으로 보낸 등급, 시각)
+        self._down: dict[int, float] = {}          # track_id → 계산 등급이 보낸 등급보다 낮아지기 시작한 시각
         self._last = -1e9                          # 마지막으로 큐에 넣은 시각
         self.stats = {"sent": 0, "lost": 0, "heartbeat": 0, "deferred": 0, "queue_full": 0}
         # deferred = 송신이 밀려서 같은 등급 갱신을 미룬 프레임 수
@@ -65,9 +73,10 @@ class AlertGen:
         return 2 if tr["level"] >= 2 else 1
 
     def backlog(self) -> int:
-        """큐에 넣었는데 아직 안 끝난(대기 + 송신 중) 경보 수. AlertTx stats(acked + failed)로 셈"""
+        """큐에 넣었는데 아직 안 끝난(대기 + 송신 중) 경보 수. AlertTx stats(acked + failed + 건너뜀)로 셈"""
         s = getattr(self.tx, "stats", None) or {}
-        return max(0, self.stats["sent"] - s.get("acked", 0) - s.get("failed", 0))
+        done = s.get("acked", 0) + s.get("failed", 0) + s.get("superseded", 0)
+        return max(0, self.stats["sent"] - done)
 
     def update(self, tracks: list, now: float) -> list:
         """매 프레임 호출. 이번에 큐에 넣은 경보 목록을 돌려줌 (대부분 프레임은 빈 목록)"""
@@ -81,6 +90,13 @@ class AlertGen:
             if tr.get("dist_m") is None:           # 거리를 아직 모르면 기다림 (소실로 치지 않음)
                 continue
             last = self._sent.get(tid)
+            # 올림은 바로, 내림은 낮은 등급이 hold_s 동안 이어질 때만
+            # (경고선 근처 거리 잡음으로 위험↔경계가 매 프레임 바뀌면 경보가 쏟아져 큐가 넘침)
+            if last is not None and lvl < last[0]:
+                if now - self._down.setdefault(tid, now) < self.hold_s:
+                    lvl = last[0]
+            else:
+                self._down.pop(tid, None)
             if last is not None and last[0] == lvl:            # 같은 등급 → 주기 갱신만 (아래에서 따로)
                 late = (now - last[1]) / self.period[lvl]
                 if late >= 1.0:
@@ -101,6 +117,7 @@ class AlertGen:
                 out.append(a)
         for tid in [k for k in self._sent if k not in seen]:   # 사라진 표적 → 없음 한 번
             del self._sent[tid]
+            self._down.pop(tid, None)
             self.stats["lost"] += 1
             a = self._zero(tid)
             if self._submit(a, now):
@@ -118,6 +135,7 @@ class AlertGen:
         for tid in list(self._sent):
             self._submit(self._zero(tid), now)
         self._sent.clear()
+        self._down.clear()
         th = threading.Thread(target=self.tx.flush, daemon=True)
         th.start()
         th.join(timeout)
@@ -174,7 +192,8 @@ def make_alert_gen(port, node_id: int = 1, **kwargs):
     tx = AlertTx(lora, node_id=node_id)
     tx.start()
     print(f"[lora] 관측소 {node_id} → 지휘소 경보 송신 ({port}). 등급 바뀌면 바로, 같은 등급은 "
-          f"{PERIOD_S[1]:g}/{PERIOD_S[2]:g}/{PERIOD_S[3]:g}초마다, 표적 없으면 {HEARTBEAT_S:g}초마다 생존 신호")
+          f"{PERIOD_S[1]:g}/{PERIOD_S[2]:g}/{PERIOD_S[3]:g}초마다, 표적 없으면 {HEARTBEAT_S:g}초마다 생존 신호, "
+          f"ACK 대기 {tx.ack_timeout:g}초 × 재전송 {tx.retries}회")
     return AlertGen(tx, lora=lora, **kwargs)
 
 
@@ -204,6 +223,8 @@ if __name__ == "__main__":
             except queue.Empty:
                 return b""
 
+    TEST_PERIOD = {1: 2.0, 2: 1.0, 3: 0.5}   # 시험은 주기 고정 (기본값을 실측으로 바꿔도 시험 결과는 그대로)
+
     def station(node_id: int, airtime: float = 0.0, **tx_kw):
         """관측소 AlertTx ─가짜 무선─ 지휘소 AlertRx → UDP 소켓"""
         a, b = FakeLora(airtime), FakeLora(airtime)
@@ -230,7 +251,7 @@ if __name__ == "__main__":
     # 1) 정책: 30 fps로 16초 (가상 시각)
     #    0~2초 관심(50 m) → 2~4초 경계(35 m, 3 m/s 접근) → 4~5초 위험(15 m) → 사라짐 → 표적 없음
     tx, gui, stop = station(4, ack_timeout=0.05, retries=2)
-    gen = AlertGen(tx)
+    gen = AlertGen(tx, period=TEST_PERIOD)
     frames = 0
     for k in range(16 * 30):
         t = k / 30
@@ -256,7 +277,7 @@ if __name__ == "__main__":
     # 2) 느린 무선 (한 번 보내는 데 0.15 s → 경보 + ACK 0.3 s): 위험 표적 3개가 0.5초마다 갱신하려 하면 넘침
     #    → 같은 등급 갱신을 미뤄서 큐가 안 쌓이고, 표적마다 고르게 최신 값이 나가야 함
     tx, gui, stop = station(5, airtime=0.15, ack_timeout=0.5, retries=1)
-    gen = AlertGen(tx)
+    gen = AlertGen(tx, period=TEST_PERIOD)
     t0, peak = time.monotonic(), 0
     while (now := time.monotonic()) - t0 < 3.0:
         tracks = [dict(id=i, level=2, dist_m=10.0 + i + (now - t0), src="stereo", closing_mps=4.0, tta_s=3.0,
@@ -270,5 +291,24 @@ if __name__ == "__main__":
     print(f"[느린 무선] 표적별 위험 경보 {per}, 최대 대기 {peak}, 생성 {gen.stats}, 송신 {tx.stats}")
     assert peak <= BACKLOG_MAX and gen.stats["deferred"] > 0 and gen.stats["queue_full"] == 0
     assert tx.stats["dropped"] == 0 and tx.stats["failed"] == 0 and max(per.values()) - min(per.values()) <= 1, per
+
+    # 3) 경고선(20 m) 근처에서 거리가 매 프레임 19.5 ↔ 20.5로 흔들림 (스테레오 잡음)
+    #    → 위험으로는 바로 올라가되, 위험↔경계가 매 프레임 바뀌며 경보가 쏟아지면 안 됨
+    #    그 뒤 25 m로 계속 머물면 HOLD_S 지나서 경계로 내려와야 함
+    tx, gui, stop = station(6, ack_timeout=0.05, retries=2)
+    gen = AlertGen(tx, period=TEST_PERIOD)
+    for k in range(int(5 * 30)):
+        t = k / 30
+        d = (19.5 if k % 2 else 20.5) if t < 3 else 25.0
+        if gen.update([dict(id=1, level=2, dist_m=d, src="stereo", closing_mps=0.0, tta_s=None,
+                            az_deg=0.0, el_deg=0.0)], t):
+            tx.flush()                             # 순서 고정용 (안 기다리면 큐가 위험부터 내보냄)
+    gen.close()
+    levels = [m["level"] for m in received(gui, stop)]
+    print(f"[경고선 흔들림] 5초 동안 경보 {len(levels)}개: 등급 {levels}, 생성 {gen.stats}")
+    # 경계 → 위험(바로) → 위험 주기 갱신만 → 25 m에서 HOLD_S 지나 경계 → 사라짐 '없음'
+    assert len(levels) <= 15 and levels[:2] == [2, 3] and levels[-2:] == [2, 0], levels
+    assert set(levels[1:-2]) == {3} and gen.stats["queue_full"] == 0, levels
+
     print("alert_gen.py 자체 시험 통과: 매 프레임 안 보냄, 등급 바뀌면 바로, 주기 갱신, 소실 '없음', 생존 신호, "
-          "느린 무선에서 갱신 미룸")
+          "느린 무선에서 갱신 미룸, 경고선 근처 흔들림에도 경보 안 쏟아짐")
