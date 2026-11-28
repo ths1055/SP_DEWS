@@ -39,14 +39,16 @@
 | ----------------------- | ---------------------------------------------------- | ----------------------- | -------------------------------------------------- |
 | `protocol.py`         | import (자체 시험: `python protocol.py`)           | 완료, 자체 시험 통과    | 패킷 포장·개봉, CRC-16, 스트림 파서, seq 카운터   |
 | `e22.py`              | import (설정 도구: `python e22.py --read/--write`, 자체 시험: `--test`) | 작성 완료, 실기 시험 전 | 모드 전환(M0/M1), AUX 대기, 송수신, 레지스터 설정  |
-| `alert_gen.py`        | import (`detect_stereo.py --lora`, 자체 시험: `python alert_gen.py`) | 작성 (임시, 호재 확인 필요), 자체 시험 통과 | 관측소 경보 생성: 탐지 결과 → 관심·경계·위험 → 전송 정책대로 `AlertTx` 큐, 표적 없으면 생존 신호 |
+| `alert_gen.py`        | import (`detect_stereo.py --lora`, 자체 시험: `python alert_gen.py`) | 호재 검토 (11/28, 등급 내림 유지 추가), 자체 시험 통과 | 관측소 경보 생성: 탐지 결과 → 관심·경계·위험 → 전송 정책대로 `AlertTx` 큐, 표적 없으면 생존 신호 |
 | `alert_tx.py`         | import (실기 시험: `python alert_tx.py`)           | 작성 완료, 실기 시험 전 | 관측소 송신: 우선순위 TX 큐 + LoRa 스레드, ACK 대기·재전송 |
 | `alert_rx.py`         | 직접 실행                                            | 작성 완료, 실기 시험 전 | 지휘소 수신: ACK 회신, `(node_id, seq)` 중복 제거, GUI로 UDP JSON |
 | `test/test_alert.py`  | 직접 실행 (하드웨어 불필요)                          | 통과                    | 가짜 E22 2개로 우선순위·재전송·중복 제거·UDP 확인 |
 | `test/test_send.py`   | 직접 실행                                            | 실기 송수신 확인        | 송신 시험 (`--raw` 글자 / 기본 경보 패킷)        |
 | `test/test_recv.py`   | 직접 실행                                            | 실기 송수신 확인        | 수신 시험, 종료 시 전달률·CRC 오류·누락 seq 출력 |
+| `test/test_link.py`   | 직접 실행 (관측소 쪽, 자체 시험: `--selftest`)       | 작성, 가짜 E22 시험 통과, 실기 전 | 표시 지연(송신→ACK)·전달률 측정, 목표(2 s·95%) 판정, `--csv`로 거리별 기록 |
+| `test/fake_lora.py`   | import                                               | —                       | 하드웨어 없는 시험용 가짜 E22 (`test_alert`·`test_link` 공용) |
 | `test/rssi_check.py`  | 직접 실행                                            | 실기 확인               | 채널 잡음·마지막 수신 패킷 세기(dBm) — 무선부 고장 진단용 |
-| `lcd.py`              | import                                               | 정리함                  | I2C 16×2 LCD (PCF8574, 0x27). ASCII만 가능        |
+| `dummy/`              | —                                                    | 채택 안 함 (보관)       | `run.py`(임시 파이프라인, `detect_stereo --lora`로 대체), `lcd.py`(실제 LCD는 `yolo_module/pi/lcd_ui.py`) |
 | `gui.py`              | 직접 실행 (`--demo`, `--lora COM4`, 자체 시험: `--selftest`) | 작성, 데모·가짜 LoRa로 시험 통과 | 지휘소 앱 (PySide6 창): 전술 스코프·주 표적·Wi-Fi 영상·기록·한국어 음성 안내·관측소 신호 끊김 표시 |
 | `hud/`                | import                                               | 작성                    | gui.py 화면 조각: `model.py` 경보→표적 상태, `media.py` 영상·음성·경보음, `widgets.py` 그림, `fonts/` (SIL OFL) |
 | `build_exe.py`        | 직접 실행 (윈도우)                                   | 빌드 스크립트 확인       | gui.py → `dist/SP_DEWS_HUD/SP_DEWS_HUD.exe` (파이썬 없는 PC에서도 실행) |
@@ -133,10 +135,12 @@ Threat(track_id, level, dist_m, speed_mps, tta_s, az_deg, el_deg, mode)  # mode:
 
 지금 `alert_gen.py`는 `detect_stereo.py`의 RangeJudge가 주는 표적 dict(`id, dist_m, src, closing_mps, tta_s, az_deg, el_deg, level`)를 그대로 받습니다. RangeJudge 등급은 1(감지)/2(WARNING)뿐이라 3단계는 `alert_gen`이 나눔: **위험** = 경고선(20 m) 안 또는 5초 안 도달, **경계** = 탐지 WARNING, **관심** = 나머지.
 
-**전송 정책** (`alert_gen.py`에 구현, 호재 확인 필요)
+**전송 정책** (`alert_gen.py`에 구현, 11/28 호재 검토)
 
 - 매 프레임(30 fps) 전송 금지 — LoRa 대역폭 초과
-- 새 표적·등급 변화는 즉시, 같은 등급은 관심 2초·경계 1초·위험 0.5초마다 갱신
+- 새 표적·등급 올림은 즉시, 같은 등급은 관심 2초·경계 1초·위험 1초마다 갱신 (위험 주기는 경보+ACK 실측 × 2, 실측 전 값)
+- 같은 표적은 최신 경보만 송신: 큐에서 기다리는 동안 더 새 경보가 오면 옛 것은 건너뜀 (등급 순 큐 때문에 옛 경보가 나중에 도착해 지휘소에 옛 상태가 남던 문제)
+- 등급 내림은 낮은 등급이 1.5초 이어져야 (경고선 20 m 근처에서 거리 잡음으로 위험↔경계가 매 프레임 바뀌면 5초에 경보 93개 → 큐가 넘쳐 다른 경보까지 버려짐. 고친 뒤 12개)
 - 송신이 밀리면(끝나지 않은 경보 3건 이상) 같은 등급 갱신은 미룸 → 큐에 옛날 위치가 안 쌓이고, 풀리면 오래 기다린 표적부터 최신 값으로
 - 표적이 사라지면 '없음' 한 번
 - 표적이 없으면 5초마다 **생존 신호**(등급 0 + track_id 0) → 지휘소가 15초 넘게 아무것도 못 받으면 "관측소 신호 끊김"(드론 없음과 구분)
@@ -168,13 +172,14 @@ GPIO 정리 (BCM): E22 = 14·15·17·22·27, LCD = 2·3 (I2C), **부저 = 18**. 
 
 | 순서 | 어디서          | 명령                                                          | 확인                        |
 | ---- | --------------- | ------------------------------------------------------------- | --------------------------- |
-| 1    | 아무 PC         | `python protocol.py`, `python e22.py --test`, `python test/test_alert.py` | 모두 "통과"       |
+| 1    | 아무 PC         | `python protocol.py`, `python e22.py --test`, `python test/test_alert.py`, `python test/test_link.py --selftest` | 모두 "통과"       |
 | 2    | Pi 2대 각각     | `python e22.py --read`                                      | 설정값 출력 → 배선 OK      |
 | 3    | Pi 2대 각각     | `python e22.py --write`                                     | 두 모듈 설정 일치           |
 | 4    | 수신 → 송신 순 | `python test/test_recv.py --raw` / `python test/test_send.py --raw` | `hello 0, 1, ...` 수신    |
 | 5    | 수신 → 송신 순 | `python test/test_recv.py` / `python test/test_send.py --count 100` | 패킷 출력, Ctrl+C 후 전달률 |
 | 6    | 수신 → 송신 순 | `python alert_rx.py` / `python alert_tx.py --count 20`  | ACK 20/20, 재전송 횟수 확인 |
-| 7    | 지휘소 → 관측소 | `python gui.py --lora COM4` / `python3 detect_stereo.py ... --lora --node-id 1` (`yolo_module/pi`) | 앱 머리줄 "● 관측소 1 정상", 드론 보이면 관심→경계→위험 |
+| 7    | 수신 → 송신 순 | `python alert_rx.py` / `python test/test_link.py --count 100 --label 1m --csv link.csv` | 판정 "통과" (전달률 95% 이상, 95% 지연 2 s 이내) |
+| 8    | 지휘소 → 관측소 | `python gui.py --lora COM4` / `python3 detect_stereo.py ... --lora --node-id 1` (`yolo_module/pi`) | 앱 머리줄 "● 관측소 1 정상", 드론 보이면 관심→경계→위험 |
 
 노트북은 `--no-gpio --port COM3`(또는 `/dev/ttyUSB0`)을 붙입니다.
 
@@ -224,16 +229,20 @@ pip install pyinstaller && python build_exe.py   # exe 만들기 → dist/SP_DEW
 | 11/1주      | 보드 2대 송수신 시험                   | `test/test_send.py`, `test/test_recv.py` | 송수신 확인 (11/17, 노트북↔PC) |
 | 11/2주      | ACK 대기·재전송 (송신 측)             | `alert_tx.py`                    | 작성, 실기 시험 전       |
 | 11/2주      | ACK 회신·중복 제거 (수신 측)          | `alert_rx.py`                    | 작성, 실기 시험 전       |
-| 11/2~3주    | 판정 결과 → 경보 생성 (부저·LCD는 탐지 쪽 `--buzzer-pin`·`--lcd`) | `alert_gen.py`, `detect_stereo.py --lora` | 작성 (임시, 호재 확인 필요). 가짜 카메라 → 가짜 E22 → 지휘소 앱까지 시험 통과 |
+| 11/2~3주    | 판정 결과 → 경보 생성 (부저·LCD는 탐지 쪽 `--buzzer-pin`·`--lcd`) | `alert_gen.py`, `detect_stereo.py --lora` | 호재 검토 (11/28). 가짜 카메라 → 가짜 E22 → 지휘소 앱까지 시험 통과 |
 | 11/3주      | 지휘소 GUI 연동 (공동)                 | `gui.py`, `hud/`                 | 작성 (데모·가짜 LoRa 시험 통과, 실기 전) |
 | 11/4주      | Wi-Fi 영상 (라이브·경고 클립)          | `yolo_module/pi/video_link.py`   | 작성 (가짜 카메라로 시험 통과) |
-| 11/3~4주    | 표시 지연·전달률 측정                 | `test_link.py`                   | 예정                     |
+| 11/3~4주    | 표시 지연·전달률 측정                 | `test/test_link.py`              | 작성 (가짜 E22 시험 통과), 실기 측정 전 |
 | 11/4~12/1주 | 실외 20 m 시험, 다중 표적, 데모 리허설 | —                                 | 예정                     |
 
 ### 실기 시험 때 기록할 것
 
 - `test/test_send.py`가 출력하는 **패킷당 송신 시간(ms)** → `alert_tx.py`의 `ACK_TIMEOUT_S`·`RETRIES` 근거
-- 거리·장애물별 전달률, CRC 오류 횟수
+- 실측 전 기본값: ACK 대기 0.8 s × 재전송 2회, 위험 갱신 1 s. **코드 안 고치고 바꿔서 시험**:
+  `SP_ACK_TIMEOUT=1.0 SP_RETRIES=1 SP_DANGER_PERIOD=0.5 python3 detect_stereo.py ... --lora` (시작할 때 `[lora]` 줄에 적용된 값 출력)
+  `test/test_link.py --ack-timeout 1.0 --retries 1`도 같은 값을 시험. 정해지면 `alert_tx.py`·`alert_gen.py` 기본값에 반영
+- 거리·장애물별 전달률, CRC 오류 횟수 → `test/test_link.py --label <거리> --csv link.csv`로 한 줄씩 쌓기
+- `test_link.py`의 지연은 송신→ACK 시간이라 실제 표시 지연보다 길거나 같음 (보수적인 값)
 
 ### 열린 질문
 
